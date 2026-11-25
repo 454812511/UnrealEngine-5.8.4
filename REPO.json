@@ -1,0 +1,10 @@
+{
+  "owner": "454812511",
+  "repo": "UnrealEngine-5.8.4",
+  "source_repo": "EpicGames/UnrealEngine",
+  "source_branch": "release",
+  "source_commit": "f45729c0b6f097038e72b52d366a62baeca3275b",
+  "total_files": 224010,
+  "manifest": "MANIFEST.sha256",
+  "tooling_branch": "restore-tooling"
+}

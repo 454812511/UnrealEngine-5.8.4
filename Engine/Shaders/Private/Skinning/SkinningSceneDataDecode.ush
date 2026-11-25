@@ -1,0 +1,67 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "SkinningDataDecode.ush"
+#include "../SceneData.ush"
+#include "../BitPacking.ush"
+#include "../BoneTransform.ush"
+
+// Handle ref pose by using an impossible offset with the high bit set. We'll check for the high bit on load
+// to short-circuit it and return identity
+#define SKINNING_REF_POSE_TRANSFORM_OFFSET 0x80000000u
+
+float4x3 LoadSkinningBoneTransform(uint TransformIndex)
+{
+	if ((TransformIndex & SKINNING_REF_POSE_TRANSFORM_OFFSET) != 0u)
+	{
+		return float4x3(1, 0, 0,  0, 1, 0,  0, 0, 1,  0, 0, 0);
+	}
+	return LoadCompressedBoneTransform(Scene.Skinning.BoneTransforms, 0, TransformIndex);
+}
+
+float3x4 LoadSkinningBoneTransformTransposed(uint TransformIndex)
+{
+	if ((TransformIndex & SKINNING_REF_POSE_TRANSFORM_OFFSET) != 0u)
+	{
+		return float3x4(1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0);
+	}
+	return LoadCompressedBoneTransformTransposed(Scene.Skinning.BoneTransforms, 0,TransformIndex);
+}
+
+#if COMPILER_SUPPORTS_HLSL2021
+
+FSkinningHeader LoadSkinningHeader(uint InPrimitiveIndex)
+{
+	const uint Offset = InPrimitiveIndex * (uint)sizeof(FSkinningHeader);
+	return Scene.Skinning.Headers.Load<FSkinningHeader>(Offset);
+}
+
+FBoneTransformWithScale LoadSkinningBoneObjectSpaceWithScale(uint BufferOffset, uint BoneIndex)
+{
+	const uint BufferOffsetBytes = BufferOffset * (uint)sizeof(float);
+	return Scene.Skinning.BoneObjectSpace.Load<FBoneTransformWithScale>(BufferOffsetBytes + BoneIndex * (uint)sizeof(FBoneTransformWithScale));
+}
+
+FBoneTransform LoadSkinningBoneObjectSpace(uint BufferOffset, uint BoneIndex)
+{
+	const uint BufferOffsetBytes = BufferOffset * (uint)sizeof(float);
+	return Scene.Skinning.BoneObjectSpace.Load<FBoneTransform>(BufferOffsetBytes + BoneIndex * (uint)sizeof(FBoneTransform));
+}
+
+uint GetSkinningBoneTransformOffset(FSkinningHeader SkinningHeader, uint InstanceIndex, bool bPrevious)
+{
+	if (SkinningHeader.bIsRefPose)
+	{
+		return SKINNING_REF_POSE_TRANSFORM_OFFSET;
+	}
+	return SkinningHeader.TransformBufferOffset + (InstanceIndex + (bPrevious ^ SkinningHeader.CurrentTransformSlot)) * SkinningHeader.MaxTransformCount;
+}
+
+uint GetSkinningBoneTransformOffset(uint PrimitiveIndex, uint InstanceIndex, bool bPrevious)
+{
+	FSkinningHeader SkinningHeader = LoadSkinningHeader(PrimitiveIndex);
+	return GetSkinningBoneTransformOffset(SkinningHeader, InstanceIndex, bPrevious);
+}
+
+#endif // !COMPILER_SUPPORTS_HLSL2021

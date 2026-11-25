@@ -1,0 +1,67 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v10.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v10.0": {
+      "IPhonePackager/1.0.0": {
+        "dependencies": {
+          "BouncyCastle.Crypto": "1.6.1.0",
+          "Ionic.Zip.Reduced": "1.9.1.8",
+          "SysadminsLV.Asn1Parser": "1.2.7.62"
+        },
+        "runtime": {
+          "IPhonePackager.dll": {}
+        }
+      },
+      "BouncyCastle.Crypto/1.6.1.0": {
+        "runtime": {
+          "BouncyCastle.Crypto.dll": {
+            "assemblyVersion": "1.6.1.0",
+            "fileVersion": "1.6.1.0"
+          }
+        }
+      },
+      "Ionic.Zip.Reduced/1.9.1.8": {
+        "runtime": {
+          "Ionic.Zip.Reduced.dll": {
+            "assemblyVersion": "1.9.1.8",
+            "fileVersion": "1.9.1.8"
+          }
+        }
+      },
+      "SysadminsLV.Asn1Parser/1.2.7.62": {
+        "runtime": {
+          "SysadminsLV.Asn1Parser.dll": {
+            "assemblyVersion": "1.2.7.62",
+            "fileVersion": "1.2.7.62"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "IPhonePackager/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "BouncyCastle.Crypto/1.6.1.0": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Ionic.Zip.Reduced/1.9.1.8": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "SysadminsLV.Asn1Parser/1.2.7.62": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

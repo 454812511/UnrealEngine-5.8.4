@@ -1,0 +1,537 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+#include "/Engine/Public/Platform.ush"
+
+#define COLLISION_MAX_DISTANCE 999999
+#define COLLISION_TYPE_CARD 0
+#define COLLISION_TYPE_CYLINDER 1
+#define EPSILON 1e-6
+
+struct PVRaycastOrigin
+{
+	int PointNumber;
+	int BranchNumber;
+	float3 Position;
+};
+
+struct PVCollisionData
+{
+	int PointNumber;
+	int BranchNumber;
+	int ApicalRay;
+	int Type;
+	float3 Position;
+	float3 Direction;
+	float3 Extents;
+};
+
+struct PVLightDetectionData
+{
+	int PointNumber;
+	int RayNumber;
+	float3 Direction;
+	float LightValue;
+	int Hits;
+	int FaliureType;
+};
+
+// Object-space geometry for one unique static mesh, shared across all instances.
+// Must match FPVMeshGeometryRange in PVLightDetection.h (16 bytes).
+struct PVMeshGeometryRange
+{
+	int StartVertex;
+	int EndVertex;
+	int StartIndex;
+	int EndIndex;
+};
+
+// One placed instance: references shared geometry and carries its own transform + world AABB.
+// Must match FPVMeshInstanceData in PVLightDetection.h (112 bytes).
+struct PVMeshInstanceData
+{
+	float4x4 Transform;    // object-to-world  (64 bytes)
+	float4   AABBMin;      // world-space AABB  (16 bytes, w unused)
+	float4   AABBMax;      // world-space AABB  (16 bytes, w unused)
+	int      GeometryIndex;//                   ( 4 bytes)
+	int      _Pad0;        //                   (12 bytes padding)
+	int      _Pad1;
+	int      _Pad2;
+};
+
+// One placed leaf instance: same layout as PVMeshInstanceData but carries a BranchNumber so
+// the shader can skip leaves that belong to the same branch as the ray-cast origin.
+// Must match FPVLeafMeshInstanceData in PVLightDetection.h (112 bytes).
+struct PVLeafMeshInstanceData
+{
+	float4x4 Transform;    // object-to-world  (64 bytes)
+	float4   AABBMin;      // world-space AABB  (16 bytes, w unused)
+	float4   AABBMax;      // world-space AABB  (16 bytes, w unused)
+	int      GeometryIndex;//                   ( 4 bytes)
+	int      BranchNumber; //                   ( 4 bytes)
+	int      _Pad0;        //                   ( 8 bytes padding)
+	int      _Pad1;
+};
+
+uint NumCollisionData;
+uint MaxBounce;
+uint NumRaycastOrigins;
+uint NumInstances;
+uint NumGeometries;
+uint NumLeafInstances;
+StructuredBuffer<PVRaycastOrigin>       RaycastOrigins;
+StructuredBuffer<PVCollisionData>       CollisionData;
+StructuredBuffer<float3>                Rays;
+StructuredBuffer<PVMeshGeometryRange>   MeshGeometries;
+StructuredBuffer<PVMeshInstanceData>    MeshInstances;
+StructuredBuffer<PVLeafMeshInstanceData> LeafInstances;
+StructuredBuffer<float3>                ColliderMeshVertices;
+StructuredBuffer<uint>                  ColliderMeshIndices;
+RWStructuredBuffer<PVLightDetectionData> LightDetectionData;
+
+// ---------------------------------------------------------------------------
+// Vendor-stable dot / cross used only by RayTriangleHit's sign predicates.
+//
+// `precise` binds the HLSL compiler (no algebraic reordering, no FMA fusion in
+// the IR), but each vendor's driver still gets to lower DXIL `dp3`/`cross` into
+// whatever FMA chain it prefers — and the spec doesn't pin the bit-exact order.
+// For a ray grazing a leaf-edge, the values DdN / DdQxE2 / DdE1xQ / QdN sit at
+// a few ULP from zero, where that driver freedom flips the >0 / >=0 result
+// across machines.  Once one ray's hit-or-miss disagrees the bounce path
+// diverges, Hits/LightValue diverge, downstream growth diverges visibly.
+//
+// Engine pattern (same one DoubleFloatOperations.ush uses for Kahan summation,
+// see Platform.ush:836-856): wrap each + / - / * in INVARIANT_*().  INVARIANT
+// forces the compiler to materialise the value into a `precise` local before
+// any subsequent op can consume it, which blocks the driver from re-folding
+// the expression into a vendor-specific fused chain.  This doesn't change any
+// bit of the inputs — it just pins the order of operations on both sides of
+// the predicate so the comparison agrees on every machine.
+// ---------------------------------------------------------------------------
+float InvariantDot3(float3 A, float3 B)
+{
+	float Px  = INVARIANT_MUL(A.x, B.x);
+	float Py  = INVARIANT_MUL(A.y, B.y);
+	float Pz  = INVARIANT_MUL(A.z, B.z);
+	float Sxy = INVARIANT_ADD(Px, Py);
+	return INVARIANT_ADD(Sxy, Pz);
+}
+
+float3 InvariantCross3(float3 A, float3 B)
+{
+	return float3(
+		INVARIANT_SUB(INVARIANT_MUL(A.y, B.z), INVARIANT_MUL(A.z, B.y)),
+		INVARIANT_SUB(INVARIANT_MUL(A.z, B.x), INVARIANT_MUL(A.x, B.z)),
+		INVARIANT_SUB(INVARIANT_MUL(A.x, B.y), INVARIANT_MUL(A.y, B.x)));
+}
+
+// ---------------------------------------------------------------------------
+// Same vendor-stability story as InvariantDot3/Cross3, but for the operations
+// that FEED the predicates rather than the predicates themselves.  CL 55168998
+// pinned RayTriangleHit's hit/miss math, but the triangle vertices, the cylinder
+// discriminant, and the reflected bounce direction were still computed with raw
+// mul()/dot()/normalize()/reflect() — each of which the driver lowers into its
+// own FMA chain.  When a leaf/collider mesh is assigned those raw ops nudge a
+// vertex (or a bounce direction) by ~1 ULP, flipping the already-invariant
+// predicate across machines.  Pinning them here closes that gap so light
+// detection is bit-identical with OR without a foliage mesh assigned.
+// ---------------------------------------------------------------------------
+
+// Bit-exact equivalent of `mul(float4(P, 1.0f), M).xyz` (UE row-vector * matrix
+// convention) with the accumulation order pinned.  Used to transform mesh/leaf
+// collider vertices into world space before the ray-triangle test.
+float3 InvariantTransformPosition(float3 P, float4x4 M)
+{
+	float X = INVARIANT_ADD(INVARIANT_ADD(INVARIANT_ADD(INVARIANT_MUL(P.x, M[0].x), INVARIANT_MUL(P.y, M[1].x)), INVARIANT_MUL(P.z, M[2].x)), M[3].x);
+	float Y = INVARIANT_ADD(INVARIANT_ADD(INVARIANT_ADD(INVARIANT_MUL(P.x, M[0].y), INVARIANT_MUL(P.y, M[1].y)), INVARIANT_MUL(P.z, M[2].y)), M[3].y);
+	float Z = INVARIANT_ADD(INVARIANT_ADD(INVARIANT_ADD(INVARIANT_MUL(P.x, M[0].z), INVARIANT_MUL(P.y, M[1].z)), INVARIANT_MUL(P.z, M[2].z)), M[3].z);
+	return float3(X, Y, Z);
+}
+
+// Pinned `A * B + C` (scalar B) — blocks the compiler from picking a per-vendor
+// FMA for vector multiply-adds (PB, HitPosition, Closest, bounce position).
+float3 InvariantMad3(float3 A, float B, float3 C)
+{
+	return float3(
+		INVARIANT_ADD(INVARIANT_MUL(A.x, B), C.x),
+		INVARIANT_ADD(INVARIANT_MUL(A.y, B), C.y),
+		INVARIANT_ADD(INVARIANT_MUL(A.z, B), C.z));
+}
+
+// Vendor-stable fp32 sqrt.  The D3D spec only requires `sqrt` to be accurate to
+// +/-1 ULP — it is NOT correctly rounded — so two GPU vendors legitimately return
+// values 1 ULP apart.  That is the entire remaining divergence: the ray-miss path
+// has no sqrt and is already bit-identical across machines, but the moment a ray
+// hits geometry the cylinder discriminant and the hit-normal normalize introduce
+// sqrt, and the 1-ULP disagreement compounds through the bounce reflections.
+// `precise`/INVARIANT cannot fix this — they pin op *order*, not the accuracy of an
+// intrinsic.  One Heron correction step from the hardware sqrt seed yields a
+// correctly-rounded result that no longer depends on the vendor's sqrt.  This is the
+// scalar form of the engine's DFSqrtDemote (DoubleFloatOperations.ush, Algorithm 9);
+// INVARIANT_FMA makes the residual X - Sh*Sh exact so the correction is itself stable.
+float PVStableSqrt(float X)
+{
+	if (X <= 0.0f)
+	{
+		return 0.0f;
+	}
+	float Sh       = INVARIANT(sqrt(X));            // 1-ULP seed (vendor-specific)
+	float Residual = INVARIANT_FMA(-Sh, Sh, X);     // X - Sh*Sh, exact via fused FMA
+	float Sl       = INVARIANT_DIV(Residual, INVARIANT_MUL(2.0f, Sh));
+	return INVARIANT_ADD(Sh, Sl);
+}
+
+// Deterministic normalize.  HLSL `normalize` lowers to mul(v, rsqrt(dot(v,v))) and
+// `rsqrt` is a vendor approximation, so we build the unit vector from a vendor-stable
+// sqrt + correctly-rounded divide instead.  Returns 0 for a degenerate input rather
+// than propagating NaN (NaN comparisons are themselves a divergence risk).
+float3 InvariantNormalize(float3 V)
+{
+	float LenSq = InvariantDot3(V, V);
+	if (LenSq < EPSILON * EPSILON)
+	{
+		return float3(0, 0, 0);
+	}
+	float InvLen = INVARIANT_DIV(1.0f, PVStableSqrt(LenSq));
+	return float3(INVARIANT_MUL(V.x, InvLen), INVARIANT_MUL(V.y, InvLen), INVARIANT_MUL(V.z, InvLen));
+}
+
+// Pinned reflect: I - 2*dot(I,N)*N.  The reflected direction is the next bounce's
+// ray, so a ULP here flips which triangle/cylinder the next bounce hits.
+float3 InvariantReflect(float3 I, float3 N)
+{
+	float TwoDot = INVARIANT_MUL(2.0f, InvariantDot3(I, N));
+	return float3(
+		INVARIANT_SUB(I.x, INVARIANT_MUL(TwoDot, N.x)),
+		INVARIANT_SUB(I.y, INVARIANT_MUL(TwoDot, N.y)),
+		INVARIANT_SUB(I.z, INVARIANT_MUL(TwoDot, N.z)));
+}
+
+// Fast axis-aligned bounding box slab test.
+// Returns true if the ray [RayOrigin, +inf) hits the box before TMax.
+bool RayAABBHit(float3 RayOrigin, float3 InvRayDir, float3 BoxMin, float3 BoxMax, float TMax)
+{
+	float3 T0 = (BoxMin - RayOrigin) * InvRayDir;
+	float3 T1 = (BoxMax - RayOrigin) * InvRayDir;
+	float TEnter = max(max(min(T0.x, T1.x), min(T0.y, T1.y)), min(T0.z, T1.z));
+	float TExit  = min(min(max(T0.x, T1.x), max(T0.y, T1.y)), max(T0.z, T1.z));
+	return TExit >= 0.0f && TEnter <= TExit && TEnter < TMax;
+}
+
+//This function is the HLSL translation of FindIntersection in IterRay3Triangle3.h
+//
+// Cross-vendor determinism: the dot/cross used to compute DdN, DdQxE2, DdE1xQ,
+// QdN are routed through InvariantDot3 / InvariantCross3, and the multiply by
+// Sign plus the b1+b2 sum go through INVARIANT_MUL / INVARIANT_ADD.  This is
+// the engine's standard pattern for "I need this comparison to agree on every
+// machine" — see Platform.ush:836-856 and how DoubleFloatOperations.ush uses
+// it for Kahan summation.  The values themselves are unchanged; only their
+// evaluation order is pinned, which stops driver-level FMA fusion from
+// nudging a grazing-ray's predicate value by ~1 ULP across the zero boundary.
+bool RayTriangleHit(float3 RayOrigin, float3 RayDir, float3 Vert0, float3 Vert1, float3 Vert2, inout float t, inout float3 HitPos, inout float3 HitNormal)
+{
+	// Compute the offset origin, edges, and normal.
+	float3 Diff = RayOrigin - Vert0;
+	float3 Edge1 = Vert1 - Vert0;
+	float3 Edge2 = Vert2 - Vert0;
+	float3 Normal = InvariantCross3(Edge1, Edge2);
+
+	// Solve Q + t*D = b1*E1 + b2*E2 (Q = kDiff, D = ray direction,
+	// E1 = kEdge1, E2 = kEdge2, N = Cross(E1,E2)) by
+	//   |Dot(D,N)|*b1 = sign(Dot(D,N))*Dot(D,Cross(Q,E2))
+	//   |Dot(D,N)|*b2 = sign(Dot(D,N))*Dot(D,Cross(E1,Q))
+	//   |Dot(D,N)|*t = -sign(Dot(D,N))*Dot(Q,N)
+	float DdN = InvariantDot3(RayDir, Normal);
+	float Sign;
+	if (DdN > EPSILON)
+	{
+		Sign = 1.0;
+	}
+	else if (DdN < -EPSILON)
+	{
+		Sign = -1.0;
+		DdN = -DdN;
+	}
+	else
+	{
+		// Ray and triangle are parallel, call it a "no intersection"
+		// even if the ray does intersect.
+		return false;
+	}
+
+	float DdQxE2 = INVARIANT_MUL(Sign, InvariantDot3(RayDir, InvariantCross3(Diff, Edge2)));
+	if (DdQxE2 >= 0.0)
+	{
+		float DdE1xQ = INVARIANT_MUL(Sign, InvariantDot3(RayDir, InvariantCross3(Edge1, Diff)));
+		if (DdE1xQ >= 0.0)
+		{
+			if (INVARIANT_ADD(DdQxE2, DdE1xQ) <= DdN)
+			{
+				// Line intersects triangle, check if ray does.
+				float QdN = INVARIANT_MUL(-Sign, InvariantDot3(Diff, Normal));
+				if (QdN >= 0.0)
+				{
+					// Ray intersects triangle.
+					float Inv = (1.0) / DdN;
+					t = QdN * Inv;
+					HitNormal = Normal;
+					HitPos = RayOrigin + (t * RayDir);
+					return true;
+				}
+				// else: t < 0, no intersection
+			}
+			// else: b1+b2 > 1, no intersection
+		}
+		// else: b2 < 0, no intersection
+	}
+	// else: b1 < 0, no intersection
+
+	return false;
+}
+
+// AABB slab test followed by a triangle loop for a single mesh instance.
+// InvRayDir is precomputed by the caller and shared across all instance calls.
+// tOut is inout so successive calls automatically track the globally closest hit.
+bool RayInstanceGeometryHit(
+	float3 RayOrigin, float3 RayDir, float3 InvRayDir,
+	float4x4 Transform, float3 AABBMin, float3 AABBMax, int GeometryIndex,
+	inout float tOut, inout float3 HitPos, inout float3 HitNormal)
+{
+	if (!RayAABBHit(RayOrigin, InvRayDir, AABBMin, AABBMax, tOut))
+		return false;
+
+	PVMeshGeometryRange Geom = MeshGeometries[GeometryIndex];
+	bool bHit = false;
+
+	for (uint i = (uint)Geom.StartIndex; i < (uint)Geom.EndIndex; i += 3)
+	{
+		uint TriIndex1 = ColliderMeshIndices[i + 0];
+		uint TriIndex2 = ColliderMeshIndices[i + 1];
+		uint TriIndex3 = ColliderMeshIndices[i + 2];
+
+		// Pinned world-space transform: feeding the already-invariant RayTriangleHit
+		// bit-different vertices (from a vendor-fused mul) is exactly what breaks the
+		// fix once a leaf/collider mesh is assigned. See InvariantTransformPosition.
+		float3 Vert0 = InvariantTransformPosition(ColliderMeshVertices[Geom.StartVertex + TriIndex1], Transform);
+		float3 Vert1 = InvariantTransformPosition(ColliderMeshVertices[Geom.StartVertex + TriIndex2], Transform);
+		float3 Vert2 = InvariantTransformPosition(ColliderMeshVertices[Geom.StartVertex + TriIndex3], Transform);
+
+		float  t      = 0;
+		float3 Normal = float3(0, 0, 0);
+		if (RayTriangleHit(RayOrigin, RayDir, Vert0, Vert1, Vert2, t, HitPos, Normal) && t < tOut)
+		{
+			tOut      = t;
+			HitNormal = InvariantNormalize(Normal);
+			bHit      = true;
+		}
+	}
+
+	return bHit;
+}
+
+// Tests the ray against all external collider instances and all leaf instances.
+// Leaf instances on the same branch as the ray origin are skipped.
+// Both loops share tOut so the closest hit across all instance types wins automatically,
+// and the leaf AABB tests benefit from any closer hit already found in the collider loop.
+bool RayMeshHit(float3 RayOrigin, float3 RayDir, int RayBranchNumber, out float tOut, out float3 HitPos, out float3 HitNormal)
+{
+	tOut      = COLLISION_MAX_DISTANCE;
+	HitNormal = float3(0, 0, 0);
+	bool bHit = false;
+
+	float3 InvRayDir = 1.0f / RayDir;
+
+	for (uint inst = 0; inst < NumInstances; ++inst)
+	{
+		PVMeshInstanceData MeshInst = MeshInstances[inst];
+		bHit |= RayInstanceGeometryHit(RayOrigin, RayDir, InvRayDir,
+		                               MeshInst.Transform, MeshInst.AABBMin.xyz, MeshInst.AABBMax.xyz, MeshInst.GeometryIndex,
+		                               tOut, HitPos, HitNormal);
+	}
+
+	for (uint inst = 0; inst < NumLeafInstances; ++inst)
+	{
+		PVLeafMeshInstanceData LeafInst = LeafInstances[inst];
+		if (RayBranchNumber == LeafInst.BranchNumber)
+			continue;
+		bHit |= RayInstanceGeometryHit(RayOrigin, RayDir, InvRayDir,
+		                               LeafInst.Transform, LeafInst.AABBMin.xyz, LeafInst.AABBMax.xyz, LeafInst.GeometryIndex,
+		                               tOut, HitPos, HitNormal);
+	}
+
+	return bHit;
+}
+
+bool RayCylinderHit(float3 RayOrigin, float3 RayDirection, PVCollisionData Data, inout float t, inout float3 Normal, inout int FalureType)
+{
+	// Every value here either feeds a sign/range predicate (Disc<0, t<=0, Y in [0,1])
+	// or the bounce normal, so all dots / multiply-adds / divides are pinned with the
+	// invariant helpers — otherwise the cylinder self-occlusion test diverges across
+	// machines even with no foliage mesh assigned (the "partially works" case).
+	float3 PA = Data.Position;
+	float3 PB = InvariantMad3(Data.Direction, Data.Extents.y, Data.Position);
+	float R = Data.Extents.x;
+
+	float3 AB = PB - PA;
+	float3 AO = RayOrigin - PA;
+
+	float ABDotAB = InvariantDot3(AB, AB);
+	float ABDotRayDirection = InvariantDot3(AB, RayDirection);
+	float ABDotAO = InvariantDot3(AB, AO);
+
+	float A = INVARIANT_SUB(InvariantDot3(RayDirection, RayDirection), INVARIANT_DIV(INVARIANT_MUL(ABDotRayDirection, ABDotRayDirection), ABDotAB));
+	float B = INVARIANT_SUB(InvariantDot3(RayDirection, AO),          INVARIANT_DIV(INVARIANT_MUL(ABDotRayDirection, ABDotAO),          ABDotAB));
+	float C = INVARIANT_SUB(INVARIANT_SUB(InvariantDot3(AO, AO),      INVARIANT_DIV(INVARIANT_MUL(ABDotAO, ABDotAO), ABDotAB)),          INVARIANT_MUL(R, R));
+
+	float Disc = INVARIANT_SUB(INVARIANT_MUL(B, B), INVARIANT_MUL(A, C));
+
+	if(Disc < 0.0f)
+	{
+		FalureType = 4;
+		return false;
+	}
+
+	float SqrtDisc = PVStableSqrt(Disc); // vendor-stable: raw sqrt is only +/-1 ULP and flips the bounce path
+	float T0 = INVARIANT_DIV(INVARIANT_SUB(-B, SqrtDisc), A);
+	float T1 = INVARIANT_DIV(INVARIANT_ADD(-B, SqrtDisc), A);
+	t = (T0 > 0) ? T0 : T1;
+
+	if (t <= 0)
+	{
+		FalureType = 5;
+		return false;
+	}
+
+	float3 HitPosition = InvariantMad3(RayDirection, t, RayOrigin);
+	float Y = INVARIANT_DIV(InvariantDot3(HitPosition - PA, AB), ABDotAB);
+
+	if (Y < 0.0f || Y > 1.0f)
+	{
+		FalureType = 6;
+		return false;
+	}
+
+	float3 Closest = InvariantMad3(AB, Y, PA);
+	Normal = InvariantNormalize(HitPosition - Closest);
+
+	return true;
+}
+
+bool RayHit(float3 RayOrigin, int RayBranchNumber, float3 RayDirection, out float tOut, out float3 NormalOut, out int FalureType)
+{
+	tOut = COLLISION_MAX_DISTANCE;
+	// Initialise the out-param: when NumCollisionData==0 (and nothing is hit) neither the
+	// cylinder loop nor RayCylinderHit runs, leaving FalureType undefined — which reads back
+	// as per-driver garbage (e.g. 175177728 on one machine, 0 on the other). Purely
+	// diagnostic, but it makes the determinism dump's Pass1 CRC useless, so pin it to 0.
+	FalureType = 0;
+	bool Hit = false;
+
+	// Check skeleton cylinder self-occlusion (skip own branch)
+	for (uint i = 0; i < NumCollisionData; i++)
+	{
+		if (RayBranchNumber == CollisionData[i].BranchNumber)
+		{
+			continue;
+		}
+
+		float t = 0;
+		float3 Normal = float3(0,0,0);
+
+		bool HitCylinder = RayCylinderHit(RayOrigin, RayDirection, CollisionData[i], t, Normal, FalureType);
+
+		if (HitCylinder && t < tOut)
+		{
+			tOut      = t;
+			NormalOut = Normal;
+			Hit       = true;
+			FalureType = 0;
+		}
+	}
+
+	float t2 = COLLISION_MAX_DISTANCE;
+	float3 MeshNormal = float3(0,0,0);
+	float3 MeshHitPos;
+
+	// Check all mesh instances (external colliders + leaves, branch-filtered).
+	bool HitMesh = RayMeshHit(RayOrigin, RayDirection, RayBranchNumber, t2, MeshHitPos, MeshNormal);
+	if (HitMesh && t2 < tOut)
+	{
+		tOut      = t2;
+		NormalOut = InvariantNormalize(MeshNormal);
+		Hit       = true;
+	}
+
+	return Hit;
+}
+
+// 2D dispatch: (min(N,65535), ceil(N/65535), 1) groups x [64,1,1] threads.
+// One group = one skeleton point; threads within the group = 64 rays.
+[numthreads(64,1,1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
+{
+	// Reconstruct flat point index from 2D group ID
+	uint PointIndex = Gid.y * 65535u + Gid.x;
+	if (PointIndex >= NumRaycastOrigins)
+	{
+		return;
+	}
+
+	uint OutputIndex = PointIndex * 64u + GTid.x;
+
+	LightDetectionData[OutputIndex].PointNumber = RaycastOrigins[PointIndex].PointNumber;
+	LightDetectionData[OutputIndex].RayNumber   = GTid.x;
+
+	float3 Normal        = float3(0,0,0);
+	float3 RayPos        = RaycastOrigins[PointIndex].Position;
+	int    RayBranchNumber = RaycastOrigins[PointIndex].BranchNumber;
+	float3 RayDir        = Rays[GTid.x];
+	float  t             = COLLISION_MAX_DISTANCE;
+	int    Hits          = 0;
+	float  LightValue    = 0.1;
+	int    FaliureType   = 0;
+
+	[loop]
+	for (int Bounce = 0; Bounce < MaxBounce; Bounce++)
+	{
+		if (RayHit(RayPos, RayBranchNumber, RayDir, t, Normal, FaliureType))
+		{
+			float3 HitPosition = InvariantMad3(RayDir, t, RayPos);
+			RayPos  = HitPosition;
+			RayDir  = InvariantReflect(RayDir, Normal);
+			LightDetectionData[OutputIndex].Direction   = RayDir;
+			Hits++;
+			LightDetectionData[OutputIndex].Hits       = Hits;
+			LightDetectionData[OutputIndex].LightValue = INVARIANT_ADD(LightDetectionData[OutputIndex].LightValue, LightValue);
+		}
+		else
+		{
+			// THE root divergence (see PVLightDump_0000: 1-ULP LightValue with zero geometry).
+			// Every ray that escapes takes this sky-light fall-off, and HLSL `lerp` lowers to
+			// a vendor FMA `a + t*(b-a)`, so LightValue lands ~1 ULP apart across machines.
+			// Those ULPs accumulate through Pass 2's averaging/selection until a point's
+			// optimal-ray pick flips (first seen at PVLightDump_0017), and growth diverges.
+			// `dot((0,0,1), RayDir)` is exactly RayDir.z — use it directly, and pin the lerp.
+			LightValue = RayDir.z;
+			if (LightValue < 0.85)
+			{
+				LightValue = clamp(LightValue, 0.1, 1.0);
+				float LerpT = INVARIANT_DIV(INVARIANT_SUB(LightValue, 0.1), (0.85 - 0.1));
+				LightValue = INVARIANT_ADD(0.1, INVARIANT_MUL(LerpT, (1.0 - 0.1)));
+			}
+			else
+			{
+				LightValue = 1.0;
+			}
+			LightValue = Hits == 0 ? LightValue : INVARIANT_ADD(LightDetectionData[OutputIndex].LightValue, LightValue);
+			LightDetectionData[OutputIndex].Hits       = Hits;
+			LightDetectionData[OutputIndex].Direction  = RayDir;
+			LightDetectionData[OutputIndex].LightValue = LightValue;
+			Bounce = MaxBounce;
+		}
+	}
+	LightDetectionData[OutputIndex].FaliureType = FaliureType;
+
+	if (Hits > 0)
+	{
+		LightDetectionData[OutputIndex].LightValue = (LightDetectionData[OutputIndex].LightValue / Hits);
+	}
+}

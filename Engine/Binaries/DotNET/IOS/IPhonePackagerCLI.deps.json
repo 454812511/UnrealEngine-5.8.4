@@ -1,0 +1,91 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v10.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v10.0": {
+      "IPhonePackagerCLI/1.0.0": {
+        "dependencies": {
+          "System.Security.Cryptography.Pkcs": "10.0.6",
+          "BouncyCastle.Crypto": "1.6.1.0",
+          "Ionic.Zip.Reduced": "1.9.1.8",
+          "SysadminsLV.Asn1Parser": "1.2.7.62"
+        },
+        "runtime": {
+          "IPhonePackagerCLI.dll": {}
+        }
+      },
+      "System.Security.Cryptography.Pkcs/10.0.6": {
+        "runtime": {
+          "lib/net10.0/System.Security.Cryptography.Pkcs.dll": {
+            "assemblyVersion": "10.0.0.0",
+            "fileVersion": "10.0.626.17701"
+          }
+        },
+        "runtimeTargets": {
+          "runtimes/win/lib/net10.0/System.Security.Cryptography.Pkcs.dll": {
+            "rid": "win",
+            "assetType": "runtime",
+            "assemblyVersion": "10.0.0.0",
+            "fileVersion": "10.0.626.17701"
+          }
+        }
+      },
+      "BouncyCastle.Crypto/1.6.1.0": {
+        "runtime": {
+          "BouncyCastle.Crypto.dll": {
+            "assemblyVersion": "1.6.1.0",
+            "fileVersion": "1.6.1.0"
+          }
+        }
+      },
+      "Ionic.Zip.Reduced/1.9.1.8": {
+        "runtime": {
+          "Ionic.Zip.Reduced.dll": {
+            "assemblyVersion": "1.9.1.8",
+            "fileVersion": "1.9.1.8"
+          }
+        }
+      },
+      "SysadminsLV.Asn1Parser/1.2.7.62": {
+        "runtime": {
+          "SysadminsLV.Asn1Parser.dll": {
+            "assemblyVersion": "1.2.7.62",
+            "fileVersion": "1.2.7.62"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "IPhonePackagerCLI/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "System.Security.Cryptography.Pkcs/10.0.6": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-88tquaGJ1htm4DHWS6x9jwER7sFET2SVRN7HqO1FYZwE0diDcUmz0ajhVa8ZD2HGhDJBueSPjP/gqyP3gXtT2A==",
+      "path": "system.security.cryptography.pkcs/10.0.6",
+      "hashPath": "system.security.cryptography.pkcs.10.0.6.nupkg.sha512"
+    },
+    "BouncyCastle.Crypto/1.6.1.0": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Ionic.Zip.Reduced/1.9.1.8": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "SysadminsLV.Asn1Parser/1.2.7.62": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}
